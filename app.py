@@ -1,8 +1,11 @@
 import os
 import json
-from datetime import timedelta
-from flask import Flask, render_template, request, jsonify, Response
-from flask_jwt_extended import JWTManager, create_access_token
+import base64
+import urllib.request
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, Response, send_from_directory
+from flask_cors import CORS
+from flask_jwt_extended import JWTManager
 from werkzeug.security import generate_password_hash
 from dotenv import load_dotenv
 import cloudinary
@@ -16,9 +19,33 @@ from models import (
 
 load_dotenv()
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder="static", static_url_path="/static")
 
-# Automatic SQLite / PostgreSQL Configuration
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"]
+)
+
+try:
+    from advanced_routes import adv_bp
+    app.register_blueprint(adv_bp)
+except Exception as e:
+    print("adv_bp warning:", e)
+
+try:
+    from chat_meeting_routes import chat_bp
+    app.register_blueprint(chat_bp)
+except Exception as e:
+    print("chat_bp warning:", e)
+
+try:
+    from power_routes import power_bp
+    app.register_blueprint(power_bp)
+except Exception as e:
+    print("power_bp warning:", e)
+
 db_url = os.environ.get("DATABASE_URL", "sqlite:///bigknowledge.db")
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
@@ -35,12 +62,11 @@ if os.environ.get("CLOUDINARY_URL"):
 db.init_app(app)
 jwt = JWTManager(app)
 
-# Sirf Tables banayenge, koi Fake Data nahi bharna hai
 with app.app_context():
     db.create_all()
     if User.query.count() == 0:
         founder = User(
-            name="Vijay Dakeni",
+            name="Mr. Vijay Mistry",
             email="founder@bigknowledge.io",
             password_hash=generate_password_hash("admin123"),
             role="Founder"
@@ -48,19 +74,52 @@ with app.app_context():
         db.session.add(founder)
         db.session.commit()
 
+def upload_to_5tb_drive(file_bytes, filename, mime_type="image/png", sub_folder="Uploaded_Files"):
+    webhook_url = os.environ.get("GDRIVE_WEBHOOK_URL")
+    if not webhook_url:
+        return None
+    try:
+        payload = json.dumps({
+            "filename": filename,
+            "mime_type": mime_type,
+            "file_base64": base64.b64encode(file_bytes).decode("utf-8"),
+            "sub_folder": sub_folder
+        }).encode("utf-8")
+        req = urllib.request.Request(webhook_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            res_json = json.loads(resp.read().decode("utf-8"))
+            if res_json.get("status") == "success":
+                fid = res_json.get("file_id")
+                if fid and mime_type.startswith("image/"):
+                    return f"https://drive.google.com/thumbnail?id={fid}&sz=w2000"
+                return res_json.get("url")
+    except Exception as e:
+        print("Drive upload error:", e)
+    return None
+
 @app.route("/")
 def dashboard_home():
-    return render_template("index.html")
+    return jsonify({
+        "status": "live",
+        "service": "BigKnowledge Backend API (5TB Drive Ready)",
+        "founder": "Mr. Vijay Mistry",
+        "gdrive_5tb_connected": bool(os.environ.get("GDRIVE_WEBHOOK_URL"))
+    })
 
 @app.route("/login")
 def login_page():
-    return render_template("login.html")
+    return jsonify({"status": "login_endpoint_active"})
+
+@app.route("/static/uploads/<path:filename>")
+def serve_uploads(filename):
+    upload_dir = os.path.join(os.getcwd(), "static", "uploads")
+    return send_from_directory(upload_dir, filename)
 
 @app.route("/api/bootstrap", methods=["GET"])
 def api_bootstrap():
     return jsonify({
         "knowledge": [
-            {"id": k.id, "title": k.title, "category": k.category, "content": k.content, "media_url": k.media_url, "tags": k.tags, "is_favorite": k.is_favorite, "created_at": k.created_at.strftime("%Y-%m-%d")}
+            {"id": k.id, "title": k.title, "category": k.category, "content": k.content, "media_url": k.media_url, "tags": k.tags, "is_favorite": k.is_favorite, "created_at": k.created_at.strftime("%Y-%m-%d") if k.created_at else ""}
             for k in KnowledgeItem.query.order_by(KnowledgeItem.id.desc()).all()
         ],
         "problems": [
@@ -88,7 +147,7 @@ def api_bootstrap():
             for r in RoadmapMilestone.query.all()
         ],
         "journals": [
-            {"id": j.id, "entry_type": j.entry_type, "category_tag": j.category_tag, "title": j.title, "details": j.details, "expected_outcome": j.expected_outcome, "actual_result": j.actual_result, "created_at": j.created_at.strftime("%Y-%m-%d")}
+            {"id": j.id, "entry_type": j.entry_type, "category_tag": j.category_tag, "title": j.title, "details": j.details, "expected_outcome": j.expected_outcome, "actual_result": j.actual_result, "created_at": j.created_at.strftime("%Y-%m-%d") if j.created_at else ""}
             for j in JournalEntry.query.order_by(JournalEntry.id.desc()).all()
         ],
         "goals_habits": [
@@ -104,107 +163,99 @@ def api_bootstrap():
 @app.route("/api/knowledge", methods=["POST", "DELETE"])
 def manage_knowledge():
     if request.method == "DELETE":
-        item = KnowledgeItem.query.get(request.args.get("id"))
-        if item:
-            db.session.delete(item)
-            db.session.commit()
+        item_id = request.args.get("id")
+        if item_id:
+            item = db.session.get(KnowledgeItem, int(item_id))
+            if item:
+                db.session.delete(item)
+                db.session.commit()
         return jsonify({"status": "deleted"})
-    d = request.json
+
+    d = request.get_json(silent=True) or {}
+    media_url = d.get("media_url") or ""
+    if media_url.startswith("data:"):
+        try:
+            header, b64_data = media_url.split(",", 1)
+            mime_type = header.split(";")[0].replace("data:", "")
+            ext = mime_type.split("/")[-1] if "/" in mime_type else "bin"
+            fname = f"vault_{int(datetime.utcnow().timestamp())}.{ext}"
+            drive_link = upload_to_5tb_drive(base64.b64decode(b64_data), fname, mime_type)
+            if drive_link:
+                media_url = drive_link
+        except Exception as e:
+            print("Base64 upload error:", e)
+
     item = KnowledgeItem(
-        title=d.get("title", "Untitled"),
-        category=d.get("category", "Note"),
-        content=d.get("content", ""),
-        media_url=d.get("media_url", ""),
-        tags=d.get("tags", "knowledge")
+        title=d.get("title") or "Untitled",
+        category=d.get("category") or "Note",
+        content=d.get("content") or "",
+        media_url=media_url,
+        tags=d.get("tags") or "knowledge"
     )
     db.session.add(item)
     db.session.commit()
-    return jsonify({"status": "success", "id": item.id})
+    return jsonify({"status": "success", "id": item.id, "media_url": media_url})
 
 @app.route("/api/problems", methods=["POST", "DELETE"])
 def manage_problems():
     if request.method == "DELETE":
-        p = Problem.query.get(request.args.get("id"))
-        if p:
-            db.session.delete(p)
-            db.session.commit()
+        prob_id = request.args.get("id")
+        if prob_id:
+            p = db.session.get(Problem, int(prob_id))
+            if p:
+                db.session.delete(p)
+                db.session.commit()
         return jsonify({"status": "deleted"})
-    d = request.json
-    demand = int(d.get("market_demand", 8))
-    score = min(100, demand * 10)
+
+    d = request.get_json(silent=True) or {}
+    demand = int(d.get("market_demand") or 8)
+    score = int(d.get("opportunity_score") or min(100, demand * 10))
     p = Problem(
-        title=d.get("title", ""),
-        source=d.get("source", "Real World Observation"),
-        root_cause=d.get("root_cause", ""),
-        proposed_solution=d.get("solution", ""),
+        title=d.get("title") or "Untitled Problem",
+        source=d.get("source") or "Real World Observation",
+        root_cause=d.get("root_cause") or "",
+        proposed_solution=d.get("solution") or "",
         market_demand=demand,
-        competition_level=d.get("competition_level", "Medium"),
-        revenue_potential=d.get("revenue_potential", "₹10L - ₹1Cr"),
+        competition_level=d.get("competition_level") or "Medium",
+        revenue_potential=d.get("revenue_potential") or "₹10L - ₹1Cr",
         opportunity_score=score
     )
     db.session.add(p)
-    
-    # Solution table me bhi real entry jodein
-    if d.get("solution"):
-        sol = SolutionItem(
-            problem_title=p.title,
-            solution_title=d.get("solution"),
-            cost_estimate=d.get("cost_estimate", "₹5,000 - ₹25,000"),
-            benefits=d.get("root_cause", ""),
-            market_impact="High" if demand >= 8 else "Medium",
-            revenue_potential=p.revenue_potential
-        )
-        db.session.add(sol)
-
-    if d.get("auto_convert_startup"):
-        st = StartupIdea(
-            name=d.get("startup_name") or p.title[:30],
-            description=d.get("solution", ""),
-            revenue_model=d.get("revenue_model", "SaaS Subscription"),
-            market_size=p.revenue_potential,
-            stage="Validation",
-            priority="High",
-            feasibility_score=score,
-            progress=15
-        )
-        db.session.add(st)
     db.session.commit()
     return jsonify({"status": "success", "id": p.id})
 
 @app.route("/api/startups", methods=["POST", "PUT", "DELETE"])
 def manage_startups():
     if request.method == "DELETE":
-        st = StartupIdea.query.get(request.args.get("id"))
-        if st:
-            db.session.delete(st)
-            db.session.commit()
+        st_id = request.args.get("id")
+        if st_id:
+            st = db.session.get(StartupIdea, int(st_id))
+            if st:
+                db.session.delete(st)
+                db.session.commit()
         return jsonify({"status": "deleted"})
-    
-    d = request.json
+
+    d = request.get_json(silent=True) or {}
     if request.method == "PUT":
-        st = StartupIdea.query.get(d.get("id"))
-        if st:
-            if "progress" in d:
-                st.progress = int(d["progress"])
-            if "stage" in d:
-                st.stage = d["stage"]
-            if "feasibility_score" in d:
-                st.feasibility_score = int(d["feasibility_score"])
-            db.session.commit()
+        st_id = d.get("id")
+        if st_id:
+            st = db.session.get(StartupIdea, int(st_id))
+            if st:
+                if "progress" in d and d["progress"] is not None:
+                    st.progress = int(d["progress"])
+                if "stage" in d:
+                    st.stage = d["stage"]
+                db.session.commit()
         return jsonify({"status": "updated"})
 
     st = StartupIdea(
-        name=d.get("name", ""),
-        description=d.get("description", ""),
-        market=d.get("market", "India / Global"),
-        industry=d.get("industry", "SaaS / Tech"),
-        revenue_model=d.get("revenue_model", "Subscription"),
-        competitors=d.get("competitors", "None"),
-        market_size=d.get("market_size", "₹10Cr TAM"),
-        stage=d.get("stage", "Idea"),
-        priority=d.get("priority", "High"),
-        feasibility_score=int(d.get("feasibility_score", 85)),
-        progress=int(d.get("progress", 10))
+        name=d.get("name") or "New Venture",
+        description=d.get("description") or "",
+        revenue_model=d.get("revenue_model") or "Subscription",
+        market_size=d.get("market_size") or "₹10Cr TAM",
+        stage=d.get("stage") or "Idea",
+        feasibility_score=int(d.get("feasibility_score") or 85),
+        progress=int(d.get("progress") or 10)
     )
     db.session.add(st)
     db.session.commit()
@@ -213,68 +264,52 @@ def manage_startups():
 @app.route("/api/tasks", methods=["POST", "PUT", "DELETE"])
 def handle_tasks():
     if request.method == "DELETE":
-        t = ProjectTask.query.get(request.args.get("id"))
-        if t:
-            db.session.delete(t)
-            db.session.commit()
+        t_id = request.args.get("id")
+        if t_id:
+            t = db.session.get(ProjectTask, int(t_id))
+            if t:
+                db.session.delete(t)
+                db.session.commit()
         return jsonify({"status": "deleted"})
 
-    d = request.json
+    d = request.get_json(silent=True) or {}
     if request.method == "POST":
         t = ProjectTask(
-            title=d.get("title", ""),
-            project_name=d.get("project_name", "Main Startup"),
+            title=d.get("title") or "Untitled Task",
+            project_name=d.get("project_name") or "Main Startup",
             status="Todo",
-            kanban_stage=d.get("kanban_stage", "Ideas"),
-            priority=d.get("priority", "High"),
-            deadline=d.get("deadline", "2026-11-30"),
-            assignee=d.get("assignee", "Vijay Dakeni")
+            kanban_stage=d.get("kanban_stage") or "Ideas",
+            priority=d.get("priority") or "High",
+            deadline=d.get("deadline") or "2026-11-30",
+            dependencies=d.get("dependencies") or "None",
+            assignee=d.get("assignee") or "Mr. Vijay Mistry"
         )
         db.session.add(t)
         db.session.commit()
         return jsonify({"status": "success", "id": t.id})
     else:
-        t = ProjectTask.query.get(d.get("id"))
-        if t:
-            t.kanban_stage = d.get("kanban_stage", t.kanban_stage)
-            t.status = "Completed" if t.kanban_stage == "Completed" else "In Progress"
-            db.session.commit()
+        t_id = d.get("id")
+        if t_id:
+            t = db.session.get(ProjectTask, int(t_id))
+            if t:
+                t.kanban_stage = d.get("kanban_stage", t.kanban_stage)
+                t.status = "Completed" if t.kanban_stage == "Completed" else "In Progress"
+                db.session.commit()
         return jsonify({"status": "updated"})
 
-@app.route("/api/journals", methods=["POST"])
+@app.route("/api/journals", methods=["POST", "DELETE"])
 def create_journal():
-    d = request.json
+    d = request.get_json(silent=True) or {}
     j = JournalEntry(
-        entry_type=d.get("entry_type", "Founder Journal"),
-        category_tag=d.get("category_tag", "Daily Work"),
-        title=d.get("title", ""),
-        details=d.get("details", ""),
-        expected_outcome=d.get("expected_outcome", ""),
-        actual_result=d.get("actual_result", "")
+        entry_type=d.get("entry_type") or "Founder Journal",
+        category_tag=d.get("category_tag") or "Daily Work",
+        title=d.get("title") or "Untitled Log",
+        details=d.get("details") or ""
     )
     db.session.add(j)
     db.session.commit()
     return jsonify({"status": "success", "id": j.id})
 
-@app.route("/api/export/json", methods=["GET"])
-def export_json():
-    payload = api_bootstrap().get_json()
-    return Response(
-        json.dumps(payload, indent=2),
-        mimetype="application/json",
-        headers={"Content-Disposition": "attachment;filename=bigknowledge_backup.json"}
-    )
-
-@app.route("/api/export/csv", methods=["GET"])
-def export_csv():
-    rows = ["ID,Startup Name,Stage,Industry,Revenue Model,Market Size,Feasibility Score,Progress"]
-    for s in StartupIdea.query.all():
-        rows.append(f'{s.id},"{s.name}","{s.stage}","{s.industry}","{s.revenue_model}","{s.market_size}",{s.feasibility_score},{s.progress}')
-    return Response(
-        "\n".join(rows),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment;filename=bigknowledge_startups.csv"}
-    )
-
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)#pip install -r requirements.txt
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
